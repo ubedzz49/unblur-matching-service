@@ -1,7 +1,6 @@
 import Fastify, { FastifyInstance } from "fastify";
 import { EmbeddingRepository, InMemoryEmbeddingRepository } from "./embeddings/repository.js";
 import { EmbeddingProvider, FakeEmbeddingProvider } from "./embeddings/provider.js";
-import { ChatProvider, FakeChatProvider } from "./inference/chat-provider.js";
 
 interface RelatedExpertiseQuery {
   levelId?: string;
@@ -14,24 +13,21 @@ interface EmbedNodeBody {
   label?: string;
 }
 
-interface InferExpertiseBody {
+interface SuggestExpertiseBody {
   title?: string;
   description?: string;
+  limit?: number;
 }
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 20;
 
-// Deliberate, documented threshold for reusing an existing taxonomy node instead of creating a
-// new one: high enough that a weak/unrelated match doesn't get silently treated as the same
-// subject, low enough that close paraphrases (e.g. "dsa" vs. "Data Structures") still match once
-// both are embedded.
-const MATCH_THRESHOLD = 0.75;
+const SUGGEST_DEFAULT_LIMIT = 8;
+const SUGGEST_MAX_LIMIT = 20;
 
 export function buildApp(
   embeddingRepository: EmbeddingRepository = new InMemoryEmbeddingRepository(),
   embeddingProvider: EmbeddingProvider = new FakeEmbeddingProvider(),
-  chatProvider: ChatProvider = new FakeChatProvider(),
 ): FastifyInstance {
   const app = Fastify({
     logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
@@ -72,49 +68,27 @@ export function buildApp(
     return reply.send({ ok: true });
   });
 
-  app.post<{ Body: InferExpertiseBody }>("/match/infer-expertise", async (request, reply) => {
-    const { title, description } = request.body ?? {};
+  // Called by the frontend (through the gateway, which handles JWT verification -- no auth
+  // needed here) while a user is typing a new doubt's title/description, so they can pick
+  // from a ranked list of existing subjects instead of the service auto-detecting one for
+  // them. Pure embedding similarity -- no LLM chat call involved.
+  app.post<{ Body: SuggestExpertiseBody }>("/match/suggest-expertise", async (request, reply) => {
+    const { title, description, limit: requestedLimit } = request.body ?? {};
     if (!title) {
-      request.log.warn("infer-expertise rejected: missing title");
+      request.log.warn("suggest-expertise rejected: missing title");
       return reply.code(400).send({ error: "title is required" });
     }
 
-    let phrase = title;
-    try {
-      phrase = await chatProvider.inferTopic(title, description);
-    } catch (err) {
-      // Graceful degradation: an LLM hiccup shouldn't hard-fail the whole request -- fall back
-      // to matching on the raw title text instead of the enriched phrase.
-      request.log.warn({ err }, "infer-expertise: chat provider failed, falling back to raw title");
-      phrase = title;
-    }
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Number(requestedLimit), 1), SUGGEST_MAX_LIMIT)
+      : SUGGEST_DEFAULT_LIMIT;
 
-    let embedding: number[];
-    try {
-      embedding = await embeddingProvider.embed(phrase);
-    } catch (err) {
-      request.log.error({ err }, "infer-expertise: embedding call failed");
-      return reply.code(502).send({ error: "failed to embed inferred topic" });
-    }
+    const input = `${title} ${description ?? ""}`.trim();
+    const embedding = await embeddingProvider.embed(input);
+    const suggestions = await embeddingRepository.findNearestByEmbedding(embedding, limit);
 
-    const [top] = await embeddingRepository.findNearestByEmbedding(embedding, 1);
-
-    if (top && top.similarity >= MATCH_THRESHOLD) {
-      request.log.info(
-        { phrase, expertiseLevelId: top.expertiseLevelId, similarity: top.similarity },
-        "infer-expertise matched existing taxonomy node",
-      );
-      return reply.send({
-        matched: true,
-        expertiseTypeId: top.expertiseTypeId,
-        expertiseLevelId: top.expertiseLevelId,
-        label: top.label,
-        similarity: top.similarity,
-      });
-    }
-
-    request.log.info({ phrase }, "infer-expertise found no sufficiently close taxonomy node");
-    return reply.send({ matched: false, suggestedLabel: phrase });
+    request.log.info({ resultCount: suggestions.length }, "suggest-expertise looked up");
+    return reply.send({ suggestions });
   });
 
   return app;

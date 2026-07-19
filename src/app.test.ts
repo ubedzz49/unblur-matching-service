@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { buildApp } from "./app.js";
 import { InMemoryEmbeddingRepository } from "./embeddings/repository.js";
 import { FakeEmbeddingProvider } from "./embeddings/provider.js";
-import { ChatProvider, FakeChatProvider } from "./inference/chat-provider.js";
 
 describe("GET /healthz", () => {
   it("returns ok status", async () => {
@@ -50,9 +49,9 @@ describe("GET /match/related-expertise", () => {
   });
 });
 
-// test-only -- lets tests pin exact vectors per input text so similarity scores (and the
-// 0.75 threshold boundary) can be controlled precisely, instead of relying on
-// FakeEmbeddingProvider's derived-from-char-codes vectors.
+// test-only -- lets tests pin exact vectors per input text so similarity scores can be
+// controlled precisely, instead of relying on FakeEmbeddingProvider's derived-from-char-codes
+// vectors.
 class MappedEmbeddingProvider {
   constructor(
     private map: Record<string, number[]>,
@@ -61,12 +60,6 @@ class MappedEmbeddingProvider {
 
   async embed(text: string): Promise<number[]> {
     return this.map[text] ?? this.fallback;
-  }
-}
-
-class ThrowingChatProvider implements ChatProvider {
-  async inferTopic(): Promise<string> {
-    throw new Error("boom");
   }
 }
 
@@ -110,108 +103,110 @@ describe("POST /match/embed-node", () => {
   });
 });
 
-describe("POST /match/infer-expertise", () => {
+describe("POST /match/suggest-expertise", () => {
   it("requires a title", async () => {
     const app = buildApp();
-    const res = await app.inject({ method: "POST", url: "/match/infer-expertise", payload: {} });
+    const res = await app.inject({ method: "POST", url: "/match/suggest-expertise", payload: {} });
     expect(res.statusCode).toBe(400);
   });
 
-  it("returns matched: true when the top match is above the threshold", async () => {
+  it("returns ranked candidates ordered by similarity, highest first", async () => {
     const repo = new InMemoryEmbeddingRepository();
     await repo.upsert("dsa-node", "type-cs", "Data Structures", [1, 0]);
-
-    const provider = new MappedEmbeddingProvider({ "Data Structures": [1, 0] });
-    const chatProvider = new FakeChatProvider("Data Structures");
-
-    const app = buildApp(repo, provider as any, chatProvider);
-    const res = await app.inject({
-      method: "POST",
-      url: "/match/infer-expertise",
-      payload: { title: "stuck on dsa" },
-    });
-
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.matched).toBe(true);
-    expect(body.expertiseLevelId).toBe("dsa-node");
-    expect(body.expertiseTypeId).toBe("type-cs");
-    expect(body.similarity).toBeGreaterThanOrEqual(0.75);
-  });
-
-  it("returns matched: false with a suggestedLabel when nothing is close enough", async () => {
-    const repo = new InMemoryEmbeddingRepository();
+    await repo.upsert("algo-node", "type-cs", "Algorithms", [0.9, Math.sqrt(1 - 0.81)]);
     await repo.upsert("anatomy-node", "type-med", "Anatomy", [0, 1]);
 
-    const provider = new MappedEmbeddingProvider({ "Quantum Field Theory": [1, 0] });
-    const chatProvider = new FakeChatProvider("Quantum Field Theory");
-
-    const app = buildApp(repo, provider as any, chatProvider);
-    const res = await app.inject({
-      method: "POST",
-      url: "/match/infer-expertise",
-      payload: { title: "stuck on gauge bosons" },
-    });
-
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.matched).toBe(false);
-    expect(body.suggestedLabel).toBe("Quantum Field Theory");
-  });
-
-  it("falls back to the raw title when the chat provider throws", async () => {
-    const repo = new InMemoryEmbeddingRepository();
-    await repo.upsert("dsa-node", "type-cs", "Data Structures", [1, 0]);
-
-    // the fallback path embeds `title` directly -- map exactly that text so we can prove
-    // the embedding/matching ran against the raw title rather than any LLM output
     const provider = new MappedEmbeddingProvider({ "stuck on dsa": [1, 0] });
-    const chatProvider = new ThrowingChatProvider();
+    const app = buildApp(repo, provider as any);
 
-    const app = buildApp(repo, provider as any, chatProvider);
     const res = await app.inject({
       method: "POST",
-      url: "/match/infer-expertise",
+      url: "/match/suggest-expertise",
       payload: { title: "stuck on dsa" },
     });
 
     expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.matched).toBe(true);
-    expect(body.expertiseLevelId).toBe("dsa-node");
+    const { suggestions } = res.json();
+    expect(suggestions.map((s: any) => s.expertiseLevelId)).toEqual(["dsa-node", "algo-node", "anatomy-node"]);
+    expect(suggestions[0].similarity).toBeGreaterThanOrEqual(suggestions[1].similarity);
+    expect(suggestions[1].similarity).toBeGreaterThanOrEqual(suggestions[2].similarity);
   });
 
-  it("threshold boundary: just above 0.75 matches, just below does not", async () => {
-    // vectors chosen so cosine similarity to [1, 0] lands just above/below 0.75
-    const aboveVec = [0.77, Math.sqrt(1 - 0.77 * 0.77)]; // similarity ~0.77
-    const belowVec = [0.7, Math.sqrt(1 - 0.7 * 0.7)]; // similarity ~0.70
+  it("respects a custom limit", async () => {
+    const repo = new InMemoryEmbeddingRepository();
+    await repo.upsert("a", "type", "A", [1, 0]);
+    await repo.upsert("b", "type", "B", [0.9, 0.1]);
+    await repo.upsert("c", "type", "C", [0.5, 0.5]);
 
-    const repoAbove = new InMemoryEmbeddingRepository();
-    await repoAbove.upsert("above-node", "type", "Above", aboveVec);
-    const appAbove = buildApp(
-      repoAbove,
-      new MappedEmbeddingProvider({ topic: [1, 0] }) as any,
-      new FakeChatProvider("topic"),
-    );
-    const resAbove = await appAbove.inject({
+    const app = buildApp(repo, new FakeEmbeddingProvider());
+    const res = await app.inject({
       method: "POST",
-      url: "/match/infer-expertise",
-      payload: { title: "topic" },
+      url: "/match/suggest-expertise",
+      payload: { title: "topic", limit: 2 },
     });
-    expect(resAbove.json().matched).toBe(true);
 
-    const repoBelow = new InMemoryEmbeddingRepository();
-    await repoBelow.upsert("below-node", "type", "Below", belowVec);
-    const appBelow = buildApp(
-      repoBelow,
-      new MappedEmbeddingProvider({ topic: [1, 0] }) as any,
-      new FakeChatProvider("topic"),
-    );
-    const resBelow = await appBelow.inject({
+    expect(res.statusCode).toBe(200);
+    expect(res.json().suggestions).toHaveLength(2);
+  });
+
+  it("clamps an out-of-range limit to 1-20", async () => {
+    const repo = new InMemoryEmbeddingRepository();
+    for (let i = 0; i < 25; i++) {
+      await repo.upsert(`node-${i}`, "type", `Label ${i}`, [Math.random(), Math.random()]);
+    }
+
+    const app = buildApp(repo, new FakeEmbeddingProvider());
+    const res = await app.inject({
       method: "POST",
-      url: "/match/infer-expertise",
-      payload: { title: "topic" },
+      url: "/match/suggest-expertise",
+      payload: { title: "topic", limit: 999 },
     });
-    expect(resBelow.json().matched).toBe(false);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().suggestions.length).toBeLessThanOrEqual(20);
+  });
+
+  it("defaults to 8 when limit is omitted", async () => {
+    const repo = new InMemoryEmbeddingRepository();
+    for (let i = 0; i < 12; i++) {
+      await repo.upsert(`node-${i}`, "type", `Label ${i}`, [Math.random(), Math.random()]);
+    }
+
+    const app = buildApp(repo, new FakeEmbeddingProvider());
+    const res = await app.inject({ method: "POST", url: "/match/suggest-expertise", payload: { title: "topic" } });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().suggestions).toHaveLength(8);
+  });
+
+  it("works with description omitted (title-only)", async () => {
+    const repo = new InMemoryEmbeddingRepository();
+    await repo.upsert("dsa-node", "type-cs", "Data Structures", [1, 0]);
+
+    const provider = new MappedEmbeddingProvider({ "stuck on dsa": [1, 0] });
+    const app = buildApp(repo, provider as any);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/match/suggest-expertise",
+      payload: { title: "stuck on dsa" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().suggestions[0].expertiseLevelId).toBe("dsa-node");
+  });
+
+  it("returns an empty list gracefully when there are no embedded nodes", async () => {
+    const repo = new InMemoryEmbeddingRepository();
+    const app = buildApp(repo, new FakeEmbeddingProvider());
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/match/suggest-expertise",
+      payload: { title: "stuck on dsa" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ suggestions: [] });
   });
 });
