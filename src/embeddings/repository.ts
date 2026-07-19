@@ -8,6 +8,10 @@ export interface RelatedExpertise {
 export interface EmbeddingRepository {
   upsert(expertiseLevelId: string, expertiseTypeId: string, label: string, embedding: number[]): Promise<void>;
   findRelated(expertiseLevelId: string, limit: number): Promise<RelatedExpertise[]>;
+  // Like findRelated, but the query vector is supplied directly instead of looked up by an
+  // existing expertise_level_id -- used for matching a freshly-embedded, not-yet-persisted
+  // phrase (e.g. an LLM-inferred topic) against the existing taxonomy.
+  findNearestByEmbedding(embedding: number[], limit: number): Promise<RelatedExpertise[]>;
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -41,6 +45,18 @@ export class InMemoryEmbeddingRepository implements EmbeddingRepository {
         expertiseTypeId: row.expertiseTypeId,
         label: row.label,
         similarity: cosineSimilarity(target.embedding, row.embedding),
+      }))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, limit);
+  }
+
+  async findNearestByEmbedding(embedding: number[], limit: number): Promise<RelatedExpertise[]> {
+    return Array.from(this.rows.entries())
+      .map(([id, row]) => ({
+        expertiseLevelId: id,
+        expertiseTypeId: row.expertiseTypeId,
+        label: row.label,
+        similarity: cosineSimilarity(embedding, row.embedding),
       }))
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, limit);

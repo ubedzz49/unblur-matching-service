@@ -44,4 +44,30 @@ export class PostgresEmbeddingRepository implements EmbeddingRepository {
       similarity: r.similarity,
     }));
   }
+
+  async findNearestByEmbedding(embedding: number[], limit: number): Promise<RelatedExpertise[]> {
+    const result = await this.pool.query<{
+      expertise_level_id: string;
+      expertise_type_id: string;
+      label: string;
+      similarity: number;
+    }>(
+      `SELECT
+         e.expertise_level_id,
+         e.expertise_type_id,
+         e.label,
+         1 - (e.embedding <=> $1) AS similarity
+       FROM expertise_embeddings e
+       ORDER BY e.embedding <=> $1
+       LIMIT $2`,
+      [toVectorLiteral(embedding), limit],
+    );
+
+    return result.rows.map((r) => ({
+      expertiseLevelId: r.expertise_level_id,
+      expertiseTypeId: r.expertise_type_id,
+      label: r.label,
+      similarity: r.similarity,
+    }));
+  }
 }
