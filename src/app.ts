@@ -1,4 +1,5 @@
-import Fastify, { FastifyInstance } from "fastify";
+import Fastify, { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { logger } from "./logger.js";
 import { EmbeddingRepository, InMemoryEmbeddingRepository } from "./embeddings/repository.js";
 import { EmbeddingProvider, FakeEmbeddingProvider } from "./embeddings/provider.js";
 
@@ -28,10 +29,13 @@ const SUGGEST_MAX_LIMIT = 20;
 export function buildApp(
   embeddingRepository: EmbeddingRepository = new InMemoryEmbeddingRepository(),
   embeddingProvider: EmbeddingProvider = new FakeEmbeddingProvider(),
+  internalServiceToken: string | undefined = process.env.INTERNAL_SERVICE_TOKEN,
 ): FastifyInstance {
-  const app = Fastify({
-    logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
-  });
+  const app = Fastify(
+    process.env.NODE_ENV === "test"
+      ? { logger: false }
+      : { loggerInstance: logger as unknown as FastifyBaseLogger },
+  );
 
   // Fastify's default JSON parser rejects an empty body when Content-Type: application/json is
   // set, even for methods like DELETE that legitimately have no body -- our own frontend sends
@@ -49,6 +53,36 @@ export function buildApp(
   });
 
   app.get("/healthz", async () => ({ status: "ok" }));
+
+  // gated on the shared internal-service token, never the end-user identity header -- same
+  // pattern as every other service's /internal/ routes
+  app.addHook("preHandler", async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!request.url.startsWith("/internal/")) return;
+    const token = request.headers["x-internal-service-token"];
+    if (!token || token !== internalServiceToken) {
+      request.log.warn("rejected internal request with missing/invalid service token");
+      return reply.code(401).send({ error: "invalid internal service token" });
+    }
+  });
+
+  const VALID_LOG_LEVELS = ["info", "debug", "error"];
+
+  // runtime-mutable logging verbosity, no redeploy needed -- see src/logger.ts for the custom
+  // info<debug<error severity ordering this project uses (not pino's default trace<debug<info<
+  // warn<error<fatal).
+  app.get("/internal/log-level", async (_request, reply) => {
+    return reply.send({ level: logger.level });
+  });
+
+  app.post<{ Body: { level?: string } }>("/internal/log-level", async (request, reply) => {
+    const { level } = request.body ?? {};
+    if (typeof level !== "string" || !VALID_LOG_LEVELS.includes(level)) {
+      return reply.code(400).send({ error: `level must be one of ${VALID_LOG_LEVELS.join(", ")}` });
+    }
+    logger.level = level;
+    request.log.info({ level }, "log level changed at runtime");
+    return reply.send({ level: logger.level });
+  });
 
   app.get<{ Querystring: RelatedExpertiseQuery }>("/match/related-expertise", async (request, reply) => {
     const { levelId } = request.query;
