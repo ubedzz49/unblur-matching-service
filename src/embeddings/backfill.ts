@@ -1,3 +1,4 @@
+import { Pool } from "pg";
 import { buildDbPool } from "../db/pool.js";
 import { PostgresEmbeddingRepository } from "./postgres-repository.js";
 import { OpenRouterEmbeddingProvider } from "./openrouter-provider.js";
@@ -11,13 +12,32 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// expertise_levels/expertise_types live in User Service's own database, a separate database
+// from Matching Service's own (each service has always had its own database -- this was never
+// actually "the same shared database" the way the old comment here claimed). Reusing
+// buildDbPool()'s connection for the read side pointed it at expertise_embeddings' own database,
+// where expertise_levels/expertise_types don't exist -- every real run of this script failed
+// immediately with "relation \"expertise_levels\" does not exist", which is exactly why
+// expertise_embeddings has sat empty in production. USER_SERVICE_DB_NAME lets this connect to
+// the right database while reusing every other connection param (host/port/user/password/ssl).
+function buildUserServiceReadPool(): Pool {
+  return new Pool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT ?? 5432),
+    database: process.env.USER_SERVICE_DB_NAME ?? "unblur_user_service",
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    ssl: process.env.DB_SSL === "false" ? undefined : { rejectUnauthorized: false },
+  });
+}
+
 async function main() {
-  const pool = buildDbPool();
-  const repository = new PostgresEmbeddingRepository(pool);
+  const writePool = buildDbPool();
+  const readPool = buildUserServiceReadPool();
+  const repository = new PostgresEmbeddingRepository(writePool);
   const provider = new OpenRouterEmbeddingProvider();
 
-  // reads from user-service's tables -- same shared database, read-only from here
-  const { rows } = await pool.query<{
+  const { rows } = await readPool.query<{
     level_id: string;
     type_id: string;
     type_name: string;
@@ -41,7 +61,8 @@ async function main() {
   }
 
   logger.info({ done }, "backfill complete");
-  await pool.end();
+  await readPool.end();
+  await writePool.end();
 }
 
 main().catch((err) => {
